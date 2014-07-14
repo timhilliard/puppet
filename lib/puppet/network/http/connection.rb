@@ -9,6 +9,7 @@ module Puppet::Network::HTTP
 
   # This will be raised if too many redirects happen for a given HTTP request
   class RedirectionLimitExceededException < Puppet::Error ; end
+  class RetryLimitExceededException < Puppet::Error ; end
 
   # This class provides simple methods for issuing various types of HTTP
   # requests.  It's interface is intended to mirror Ruby's Net::HTTP
@@ -27,6 +28,7 @@ module Puppet::Network::HTTP
       :use_ssl => true,
       :verify => nil,
       :redirect_limit => 10,
+      :retry_limit => 2,
     }
 
     @@openssl_initialized = false
@@ -60,19 +62,24 @@ module Puppet::Network::HTTP
       @use_ssl = options[:use_ssl]
       @verify = options[:verify]
       @redirect_limit = options[:redirect_limit]
+      @site = Puppet::Network::HTTP::Site.new(@use_ssl ? 'https' : 'http', host, port)
+      @pool = Puppet.lookup(:http_pool)
+      @retry_limit = options[:retry_limit]
     end
 
     # @!macro [new] common_options
     #   @param options [Hash] options influencing the request made
     #   @option options [Hash{Symbol => String}] :basic_auth The basic auth
     #     :username and :password to use for the request
+    #     :idempotent Whether the request is idempotent (can be retried)
 
     # @param path [String]
     # @param headers [Hash{String => String}]
     # @!macro common_options
     # @api public
     def get(path, headers = {}, options = {})
-      request_with_redirects(Net::HTTP::Get.new(path, headers), options)
+      opts = { :idempotent => true }.merge(options)
+      request_with_redirects(Net::HTTP::Get.new(path, headers), opts)
     end
 
     # @param path [String]
@@ -91,7 +98,8 @@ module Puppet::Network::HTTP
     # @!macro common_options
     # @api public
     def head(path, headers = {}, options = {})
-      request_with_redirects(Net::HTTP::Head.new(path, headers), options)
+      opts = { :idempotent => true }.merge(options)
+      request_with_redirects(Net::HTTP::Head.new(path, headers), opts)
     end
 
     # @param path [String]
@@ -156,7 +164,11 @@ module Puppet::Network::HTTP
       @redirect_limit.times do |redirection|
         apply_options_to(current_request, options)
 
-        response = execute_request(current_request)
+        if options[:idempotent]
+          response = request_with_retries(current_request)
+        else
+          response = execute_request(current_request)
+        end
         return response unless [301, 302, 307].include?(response.code.to_i)
 
         # handle the redirection
@@ -173,6 +185,23 @@ module Puppet::Network::HTTP
         # and try again...
       end
       raise RedirectionLimitExceededException, "Too many HTTP redirections for #{@host}:#{@port}"
+    end
+
+    def request_with_retries(request)
+      response = nil
+      0.upto(@retry_limit) do |i|
+        response = nil
+        begin
+          response = execute_request(request)
+          return response if response
+        rescue SystemCallError, Net::HTTPBadResponse, Timeout::Error, SocketError
+        end
+        sleep 3 unless i == @retry_limit
+        # and try again...
+      end
+      # We reached the max retries.  We should either return the last response
+      # or raise an exception if we have one from the latest attempt.
+      raise RetryLimitExceededException, "Too many HTTP retries for #{@host}:#{@port}"
     end
 
     def apply_options_to(request, options)
